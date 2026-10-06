@@ -470,7 +470,7 @@ pub fn send_key_synthesized_after_focus(
         events.push(key_input(*mvk, true));
     }
 
-    with_confirmed_foreground(target, "key delivery", focus, || unsafe {
+    with_confirmed_foreground(target, "key delivery", focus, |_| unsafe {
         let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
         if sent as usize != events.len() {
             bail!(
@@ -501,6 +501,51 @@ pub fn send_text_synthesized(hwnd: u64, text: &str) -> Result<()> {
     send_text_synthesized_after_focus(hwnd, text, || Ok(()))
 }
 
+// Experimental, generic pacing for the foreground Unicode SendInput route.
+// It does not create another foreground transaction or another tool request.
+const FOREGROUND_TEXT_CHARACTER_DELAY: Duration = Duration::from_millis(3);
+
+fn text_character_inputs(ch: char) -> Vec<INPUT> {
+    let mut events = Vec::with_capacity(4);
+    if matches!(ch, '\r' | '\n') {
+        let return_vk = windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+        events.push(key_input(return_vk, false));
+        events.push(key_input(return_vk, true));
+        return events;
+    }
+
+    let mut buf = [0u16; 2];
+    for unit in ch.encode_utf16(&mut buf) {
+        events.push(unicode_key_input(*unit, false));
+        events.push(unicode_key_input(*unit, true));
+    }
+    events
+}
+
+fn partial_text_send_error(sent: u32, required: usize, earlier_input_sent: bool) -> anyhow::Error {
+    if earlier_input_sent || sent > 0 {
+        anyhow::anyhow!(
+            "foreground_input_outcome_unknown: SendInput inserted {sent} of {required} key events for the current scalar. Earlier text may already have been delivered; the driver stopped and did not replay it."
+        )
+    } else {
+        anyhow::anyhow!(
+            "SendInput inserted 0 of {required} key events for the first scalar; no input was sent."
+        )
+    }
+}
+
+fn foreground_text_drift_error(earlier_input_sent: bool) -> anyhow::Error {
+    if earlier_input_sent {
+        anyhow::anyhow!(
+            "foreground_input_outcome_unknown: foreground left the exact target or its verified owned window between text scalars. Earlier text may already have been delivered; the remaining suffix was not sent."
+        )
+    } else {
+        anyhow::anyhow!(
+            "foreground_unavailable: foreground left the exact target or its verified owned window before text delivery; no input was sent"
+        )
+    }
+}
+
 /// Foreground Unicode delivery with child focus established after exact
 /// top-level activation and before `SendInput`.
 pub fn send_text_synthesized_after_focus(
@@ -515,53 +560,56 @@ pub fn send_text_synthesized_after_focus(
     if let Some(msg) = crate::input::post_message_blocked_by_uipi(hwnd) {
         bail!(msg);
     }
-    // Build the key-event sequence. Printable codepoints go through as Unicode
-    // packets (KEYEVENTF_UNICODE, wVk=0, wScan=code unit), but line breaks are
-    // mapped to a real VK_RETURN keystroke — mirroring the background path
-    // (`post_enter_keystroke`) — because terminals and rich editors honour an
-    // Enter key event, not a raw `\r`/`\n` Unicode packet. `\r\n` collapses to
-    // a single Return (the `\r` emits the Enter; the following `\n` is silent).
-    let return_vk = windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
-    let mut events: Vec<INPUT> = Vec::with_capacity(text.len() * 2);
-    let mut prev_was_cr = false;
-    for ch in text.chars() {
-        match ch {
-            '\n' if prev_was_cr => {
-                prev_was_cr = false;
-            }
-            '\n' | '\r' => {
-                events.push(key_input(return_vk, false));
-                events.push(key_input(return_vk, true));
-                prev_was_cr = ch == '\r';
-            }
-            _ => {
-                prev_was_cr = false;
-                let mut buf = [0u16; 2];
-                for unit in ch.encode_utf16(&mut buf) {
-                    events.push(unicode_key_input(*unit, false));
-                    events.push(unicode_key_input(*unit, true));
-                }
-            }
-        }
-    }
-    if events.is_empty() {
+    if text.is_empty() {
         return Ok(());
     }
+    // Keep the existing Unicode packet and Enter semantics, but submit one
+    // Unicode scalar's events at a time inside the same confirmed foreground
+    // transaction. Supplementary scalars keep both UTF-16 surrogate units in
+    // one SendInput call. `\r\n` remains one Return: `\r` emits it and the
+    // following `\n` is consumed silently.
+    let mut prev_was_cr = false;
+    let mut delivery_error = None;
+    let mut sent_any = false;
+    with_confirmed_foreground(target, "text delivery", focus, |foreground_target| {
+        for ch in text.chars() {
+            if ch == '\n' && prev_was_cr {
+                prev_was_cr = false;
+                continue;
+            }
 
-    with_confirmed_foreground(target, "text delivery", focus, || unsafe {
-        let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
-        if sent as usize != events.len() {
-            bail!(
-                "SendInput inserted only {sent} of {} key events. Windows blocked \
-                 the rest: the target runs at a higher integrity level than the \
-                 Driver (UIPI), or the input desktop is locked or showing a \
-                 secure prompt. To drive an elevated app, run the Driver \
-                 elevated (the default autostart daemon is).",
-                events.len()
-            );
+            let actual = unsafe { GetForegroundWindow() };
+            if !crate::win32::foreground_matches_target_or_owned_window(
+                foreground_target,
+                actual.0 as usize as u64,
+            ) {
+                return Err(foreground_text_drift_error(sent_any));
+            }
+
+            let events = text_character_inputs(ch);
+            prev_was_cr = ch == '\r';
+            let earlier_input_sent = sent_any;
+            let sent = unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) };
+            if sent as usize != events.len() {
+                let error = partial_text_send_error(sent, events.len(), earlier_input_sent);
+                if earlier_input_sent || sent > 0 {
+                    sent_any |= sent > 0;
+                    delivery_error = Some(error);
+                    break;
+                }
+                return Err(error);
+            }
+
+            sent_any = true;
+            std::thread::sleep(FOREGROUND_TEXT_CHARACTER_DELAY);
         }
         Ok(())
-    })
+    })?;
+
+    if let Some(error) = delivery_error {
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn wait_for_exact_foreground(target: HWND, timeout: Duration) -> bool {
@@ -587,7 +635,7 @@ fn with_confirmed_foreground<T>(
     target: HWND,
     operation: &str,
     focus: impl FnOnce() -> Result<()>,
-    body: impl FnOnce() -> Result<T>,
+    body: impl FnOnce(crate::win32::ForegroundTarget) -> Result<T>,
 ) -> Result<T> {
     let previous = unsafe { GetForegroundWindow() };
     let _ = unsafe { crate::input::force_foreground_assisted(target) };
@@ -650,7 +698,7 @@ fn with_confirmed_foreground<T>(
         // Attach before inserting anything: attaching resets the shared key
         // state, which must not race with modifiers the body is about to send.
         attachment = InputQueueAttachment::attach(actual);
-        body()
+        body(foreground_target)
     })();
 
     // Keep the target foreground until its thread has read every inserted
@@ -932,5 +980,104 @@ mod extended_key_tests {
             let flags = unsafe { input.Anonymous.ki.dwFlags };
             assert_ne!(flags.0 & KEYEVENTF_EXTENDEDKEY.0, 0, "{flags:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod paced_text_event_tests {
+    use super::*;
+
+    #[test]
+    fn bmp_scalar_is_one_unicode_down_up_group() {
+        let events = text_character_inputs('\u{4e00}');
+        assert_eq!(events.len(), 2);
+        unsafe {
+            let down = events[0].Anonymous.ki;
+            let up = events[1].Anonymous.ki;
+            assert_eq!(down.wScan, '\u{4e00}' as u16);
+            assert_eq!(up.wScan, '\u{4e00}' as u16);
+            assert_ne!(down.dwFlags.0 & KEYEVENTF_UNICODE.0, 0);
+            assert_ne!(up.dwFlags.0 & KEYEVENTF_UNICODE.0, 0);
+            assert_eq!(down.dwFlags.0 & KEYEVENTF_KEYUP.0, 0);
+            assert_ne!(up.dwFlags.0 & KEYEVENTF_KEYUP.0, 0);
+        }
+    }
+
+    #[test]
+    fn supplementary_scalar_keeps_both_surrogates_in_one_group() {
+        let scalar = '\u{1f9ea}';
+        let mut encoded = [0u16; 2];
+        let units = scalar.encode_utf16(&mut encoded);
+        let events = text_character_inputs(scalar);
+        assert_eq!(units.len(), 2);
+        assert_eq!(events.len(), 4);
+        unsafe {
+            for (index, unit) in units.iter().enumerate() {
+                let down = events[index * 2].Anonymous.ki;
+                let up = events[index * 2 + 1].Anonymous.ki;
+                assert_eq!(down.wScan, *unit);
+                assert_eq!(up.wScan, *unit);
+                assert_ne!(down.dwFlags.0 & KEYEVENTF_UNICODE.0, 0);
+                assert_ne!(up.dwFlags.0 & KEYEVENTF_UNICODE.0, 0);
+                assert_eq!(down.dwFlags.0 & KEYEVENTF_KEYUP.0, 0);
+                assert_ne!(up.dwFlags.0 & KEYEVENTF_KEYUP.0, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn line_break_scalar_remains_a_return_key_pair() {
+        let return_vk = windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+        let expected_down = key_input(return_vk, false);
+        let expected_up = key_input(return_vk, true);
+        for ch in ['\r', '\n'] {
+            let events = text_character_inputs(ch);
+            assert_eq!(events.len(), 2);
+            unsafe {
+                assert_eq!(
+                    events[0].Anonymous.ki.wScan,
+                    expected_down.Anonymous.ki.wScan
+                );
+                assert_eq!(events[1].Anonymous.ki.wScan, expected_up.Anonymous.ki.wScan);
+                assert_eq!(events[0].Anonymous.ki.wVk, expected_down.Anonymous.ki.wVk);
+                assert_eq!(events[1].Anonymous.ki.wVk, expected_up.Anonymous.ki.wVk);
+                assert_eq!(
+                    events[0].Anonymous.ki.dwFlags,
+                    expected_down.Anonymous.ki.dwFlags
+                );
+                assert_eq!(
+                    events[1].Anonymous.ki.dwFlags,
+                    expected_up.Anonymous.ki.dwFlags
+                );
+                assert_eq!(events[0].Anonymous.ki.dwFlags.0 & KEYEVENTF_UNICODE.0, 0);
+                assert_eq!(events[1].Anonymous.ki.dwFlags.0 & KEYEVENTF_UNICODE.0, 0);
+            }
+        }
+        assert_eq!(FOREGROUND_TEXT_CHARACTER_DELAY, Duration::from_millis(3));
+    }
+
+    #[test]
+    fn short_write_after_a_prefix_is_explicitly_unknown_and_not_replayed() {
+        let error = partial_text_send_error(1, 4, true).to_string();
+        assert!(error.starts_with("foreground_input_outcome_unknown:"));
+        assert!(error.contains("1 of 4 key events"));
+        assert!(error.contains("Earlier text may already have been delivered"));
+        assert!(error.contains("did not replay"));
+
+        let first_send_error = partial_text_send_error(0, 2, false).to_string();
+        assert!(!first_send_error.starts_with("foreground_input_outcome_unknown:"));
+        assert!(first_send_error.contains("no input was sent"));
+    }
+
+    #[test]
+    fn foreground_drift_only_claims_no_input_when_no_prefix_was_sent() {
+        let after_prefix = foreground_text_drift_error(true).to_string();
+        assert!(after_prefix.starts_with("foreground_input_outcome_unknown:"));
+        assert!(after_prefix.contains("Earlier text may already have been delivered"));
+        assert!(after_prefix.contains("remaining suffix was not sent"));
+
+        let before_first_scalar = foreground_text_drift_error(false).to_string();
+        assert!(before_first_scalar.starts_with("foreground_unavailable:"));
+        assert!(before_first_scalar.contains("no input was sent"));
     }
 }
