@@ -1,0 +1,135 @@
+name: v0.22.2 focused-document caret candidate
+
+on:
+  push:
+    branches:
+      - codex/v0222-focused-document
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'wszkxlllll/cua' && github.ref == 'refs/heads/codex/v0222-focused-document'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 128
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.github/workflows/*.yml
+            /libs/cua-driver/rust/**
+            /libs/cua/Cargo.toml
+            /libs/cua/crates/*/Cargo.toml
+            /libs/cua/crates/cua-telemetry/**
+            /libs/cua/crates/cua-teleport/src/ux/targets.json
+            /libs/fleet/sdk/Cargo.toml
+            /libs/fleet/sdk-schema/Cargo.toml
+            /libs/images/sandbox-images.json
+
+      - name: Verify candidate scope and build the focused Windows driver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedBase = 'd114f35fec05ecd37bf529e5587be86852205b64'
+          $lockSha256 = '0BA03E166A99355E8A78D216AEAD121997D869FF657C7FA9E5A559C091FDFA1D'
+          $tagRef = 'refs/tags/cua-driver-rs-v0.22.2'
+          git fetch --no-tags --depth=1 'https://github.com/trycua/cua.git' "+${tagRef}:${tagRef}"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the pinned upstream release tag' }
+          $base = (& git rev-parse "${tagRef}^{commit}").Trim()
+          if ($LASTEXITCODE -ne 0 -or $base -cne $expectedBase) { throw 'Pinned release tag commit does not match the expected source base' }
+
+          $commit = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve candidate commit' }
+          & git merge-base --is-ancestor $base $commit
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate commit is not descended from the pinned release tag' }
+
+          $sourcePath = 'libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs'
+          $workflowPath = '.github/workflows/focused-v0222-document-caret.yml'
+          $expectedPaths = @($workflowPath, $sourcePath) | Sort-Object
+          $changedPaths = @(& git diff --name-only --no-renames $base $commit | Sort-Object)
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify candidate file scope' }
+          if (($changedPaths -join "`n") -cne ($expectedPaths -join "`n")) { throw 'Candidate changes are outside the workflow and focused Windows type source' }
+
+          $lockPath = Join-Path $env:GITHUB_WORKSPACE 'libs/cua-driver/rust/Cargo.lock'
+          $actualLockSha256 = (Get-FileHash -LiteralPath $lockPath -Algorithm SHA256).Hash
+          if ($actualLockSha256 -cne $lockSha256) { throw 'Cargo.lock does not match the pinned v0.22.2 release lockfile' }
+
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Could not install the repository-pinned Rust toolchain' }
+          $rustcVersion = (& rustc +1.97.1 --version).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify rustc version' }
+          $cargoVersion = (& cargo +1.97.1 --version).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify cargo version' }
+
+          $env:CARGO_INCREMENTAL = '0'
+          $env:CARGO_BUILD_JOBS = '2'
+          Push-Location 'libs/cua-driver/rust'
+          try {
+            cargo +1.97.1 fmt --all -- --check
+            if ($LASTEXITCODE -ne 0) { throw "Rust formatting check failed with exit code $LASTEXITCODE" }
+            cargo +1.97.1 test -p platform-windows focused_document_type_tests:: --lib --locked --jobs 2
+            if ($LASTEXITCODE -ne 0) { throw "Focused Document UIA tests failed with exit code $LASTEXITCODE" }
+            cargo +1.97.1 build --release --locked --target x86_64-pc-windows-msvc -p cua-driver --bin cua-driver --jobs 2
+            if ($LASTEXITCODE -ne 0) { throw "Cua Driver build failed with exit code $LASTEXITCODE" }
+          }
+          finally {
+            Pop-Location
+          }
+
+          $binaryPath = Join-Path $env:GITHUB_WORKSPACE 'libs/cua-driver/rust/target/x86_64-pc-windows-msvc/release/cua-driver.exe'
+          if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) { throw 'Expected driver binary was not produced' }
+          $binaryInfo = Get-Item -LiteralPath $binaryPath
+          $binarySha256 = (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256).Hash
+          $baseSourceBlob = (& git rev-parse "${base}:$sourcePath").Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve base implementation source blob' }
+          $sourceBlob = (& git rev-parse "${commit}:$sourcePath").Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve candidate implementation source blob' }
+          $workflowBlob = (& git rev-parse "${commit}:$workflowPath").Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve candidate workflow blob' }
+          $patchLines = @(& git diff --binary --no-ext-diff $base $commit -- $sourcePath)
+          if ($LASTEXITCODE -ne 0) { throw 'Could not compute implementation patch hash' }
+          $patchText = ($patchLines -join "`n") + "`n"
+          $patchHasher = [System.Security.Cryptography.SHA256]::Create()
+          try {
+            $sourcePatchSha256 = [Convert]::ToHexString($patchHasher.ComputeHash([System.Text.UTF8Encoding]::new($false).GetBytes($patchText)))
+          }
+          finally {
+            $patchHasher.Dispose()
+          }
+
+          $artifactDir = Join-Path $env:RUNNER_TEMP 'focused-v0222-document-artifact'
+          New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
+          Copy-Item -LiteralPath $binaryPath -Destination (Join-Path $artifactDir 'cua-driver.exe')
+          $manifest = [ordered]@{
+            baseTag = 'cua-driver-rs-v0.22.2'
+            baseCommit = $base
+            candidateCommit = $commit
+            sourcePath = $sourcePath
+            baseSourceBlob = $baseSourceBlob
+            candidateSourceBlob = $sourceBlob
+            sourcePatchSha256 = $sourcePatchSha256
+            workflowPath = $workflowPath
+            workflowBlob = $workflowBlob
+            cargoLockSha256 = $actualLockSha256
+            targetTriple = 'x86_64-pc-windows-msvc'
+            rustc = $rustcVersion
+            cargo = $cargoVersion
+            binary = 'cua-driver.exe'
+            binaryBytes = $binaryInfo.Length
+            binarySha256 = $binarySha256
+          }
+          ConvertTo-Json -InputObject $manifest -Depth 4 | Set-Content -LiteralPath (Join-Path $artifactDir 'manifest.json') -Encoding utf8
+          Write-Host "CANDIDATE_COMMIT=$commit"
+          Write-Host "BINARY_BYTES=$($binaryInfo.Length)"
+          Write-Host "BINARY_SHA256=$binarySha256"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cua-driver-v0.22.2-focused-document-caret-win-x64
+          path: ${{ runner.temp }}/focused-v0222-document-artifact/
+          if-no-files-found: error
+          retention-days: 7

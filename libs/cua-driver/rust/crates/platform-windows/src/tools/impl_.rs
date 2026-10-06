@@ -4000,8 +4000,8 @@ impl Tool for TypeTextTool {
             // Windows transport note.  Swift tries AXSetAttribute(kAXSelectedText)
             // first, falls back to character-by-character CGEvent synthesis.
             // Windows uses character-by-character PostMessage(WM_CHAR) to the
-            // window's focused child — there's no UIA equivalent of
-            // AXSelectedText wired up yet, so it's always the synthesis path.
+            // window's focused child, with a capability-gated UIA path for a
+            // focused empty Document on foreground delivery.
             description: "Insert text into the target pid via character-by-character \
                 PostMessage(WM_CHAR) to the focused window. No focus steal.\n\n\
                 Special keys (Return, Escape, arrows, Tab) go through `press_key` / \
@@ -4015,7 +4015,10 @@ impl Tool for TypeTextTool {
                 the system input queue), so the fallback path silently dropped chars. \
                 If you call `type_text(pid, text)` on a XAML host without `element_index`, \
                 the tool returns an actionable error pointing you at `get_window_state` \
-                first. Native ConsoleHost on Windows ARM64 is hard-refused because it can \
+                first. Foreground delivery may instead use a focused, empty, writable \
+                Document that exposes TextPattern with single selection; the tool writes \
+                the value, moves the caret to its end, and verifies both. This does not \
+                apply to single-line Edit controls. Native ConsoleHost on Windows ARM64 is hard-refused because it can \
                 accept synthesized Unicode events without delivering them; use a process \
                 or PTY setup channel instead. Legacy Win32 apps still use the PostMessage \
                 path, preserving the no-focus-steal property.\n\n\
@@ -4062,6 +4065,29 @@ impl Tool for TypeTextTool {
                 Err(error) => return ToolResult::error(error.to_string()),
             };
             let text_len = text.chars().count();
+            if args.get("element_index").is_none()
+                && args.get("element_token").is_none()
+                && args.get("x").is_none()
+                && args.get("y").is_none()
+            {
+                let uia_text = text.clone();
+                match tokio::task::spawn_blocking(move || {
+                    try_type_focused_empty_document(hwnd, None, &uia_text)
+                })
+                .await
+                {
+                    Ok(FocusedDocumentTypeOutcome::NotApplicable) => {}
+                    Ok(outcome) => {
+                        return focused_document_tool_result(outcome, text_len)
+                            .expect("non-NotApplicable UIA outcome has a ToolResult");
+                    }
+                    Err(error) => {
+                        return ToolResult::error(format!(
+                            "foreground_input_outcome_unknown: focused UIA task failed; the document may have changed; inspect before retrying ({error})"
+                        ));
+                    }
+                }
+            }
             return match tokio::task::spawn_blocking(move || {
                 crate::input::send_text_synthesized(hwnd, &text)
             })
@@ -4247,6 +4273,25 @@ impl Tool for TypeTextTool {
         // rejected (daemon not at UIAccess integrity), it returns an error
         // rather than a false success.
         if delivery == DeliveryMode::Foreground {
+            if elem_idx.is_none() && args.get("x").is_none() && args.get("y").is_none() {
+                let uia_text = text.clone();
+                match tokio::task::spawn_blocking(move || {
+                    try_type_focused_empty_document(hwnd, Some(pid), &uia_text)
+                })
+                .await
+                {
+                    Ok(FocusedDocumentTypeOutcome::NotApplicable) => {}
+                    Ok(outcome) => {
+                        return focused_document_tool_result(outcome, text_len)
+                            .expect("non-NotApplicable UIA outcome has a ToolResult");
+                    }
+                    Err(error) => {
+                        return ToolResult::error(format!(
+                            "foreground_input_outcome_unknown: focused UIA task failed; the document may have changed; inspect before retrying ({error})"
+                        ));
+                    }
+                }
+            }
             // Resolve the optional click fallback before entering the atomic
             // activation/focus/input transaction. The focus itself happens
             // only after exact top-level foreground is confirmed.
@@ -4603,6 +4648,323 @@ fn value_write_structured_result(
         "verify": verify,
         "effect": if verified { "confirmed" } else { "unverifiable" },
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusedDocumentTypeOutcome {
+    NotApplicable,
+    Confirmed,
+    Unknown(&'static str),
+}
+
+fn classify_focused_document_write(
+    set_value_attempted: bool,
+    result: Result<(), &'static str>,
+) -> FocusedDocumentTypeOutcome {
+    if !set_value_attempted {
+        return FocusedDocumentTypeOutcome::NotApplicable;
+    }
+    match result {
+        Ok(()) => FocusedDocumentTypeOutcome::Confirmed,
+        Err(stage) => FocusedDocumentTypeOutcome::Unknown(stage),
+    }
+}
+
+fn normalize_document_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn normalized_text_matches(expected: &str, actual: &str) -> bool {
+    normalize_document_line_endings(expected) == normalize_document_line_endings(actual)
+}
+
+fn focused_document_eligible(
+    exact_target: bool,
+    writable_empty_value: bool,
+    single_text_selection: bool,
+) -> bool {
+    exact_target && writable_empty_value && single_text_selection
+}
+
+fn native_window_pid(hwnd: windows::Win32::Foundation::HWND) -> Option<u32> {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    if hwnd.0.is_null() {
+        return None;
+    }
+    let mut pid = 0;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    (thread_id != 0 && pid != 0).then_some(pid)
+}
+
+fn focused_document_matches_target(
+    element: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+    target: windows::Win32::Foundation::HWND,
+    target_pid: u32,
+) -> bool {
+    use windows::Win32::UI::Accessibility::UIA_DocumentControlTypeId;
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GA_ROOT};
+
+    if unsafe { element.CurrentProcessId() }.ok() != Some(target_pid as i32)
+        || !unsafe { element.CurrentControlType() }
+            .is_ok_and(|role| role.0 == UIA_DocumentControlTypeId.0)
+        || !unsafe { element.CurrentIsEnabled() }.is_ok_and(|value| value.as_bool())
+        || !unsafe { element.CurrentHasKeyboardFocus() }.is_ok_and(|value| value.as_bool())
+    {
+        return false;
+    }
+    let Ok(hwnd) = (unsafe { element.CurrentNativeWindowHandle() }) else {
+        return false;
+    };
+    !hwnd.0.is_null()
+        && native_window_pid(hwnd) == Some(target_pid)
+        && unsafe { GetAncestor(hwnd, GA_ROOT) } == target
+}
+
+/// Opportunistically type into an exact focused empty Document. Ineligible
+/// states preserve the caller's route; post-SetValue failures are unknown.
+fn try_type_focused_empty_document(
+    target_hwnd: u64,
+    expected_pid: Option<u32>,
+    text: &str,
+) -> FocusedDocumentTypeOutcome {
+    use windows::core::{Interface, BSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationTextPattern,
+        IUIAutomationValuePattern, SupportedTextSelection_Single, TextPatternRangeEndpoint_End,
+        TextPatternRangeEndpoint_Start, UIA_TextPatternId, UIA_ValuePatternId,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsWindow};
+
+    if text.is_empty() {
+        return FocusedDocumentTypeOutcome::NotApplicable;
+    }
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
+    if !initialized {
+        return FocusedDocumentTypeOutcome::NotApplicable;
+    }
+
+    let outcome = (|| {
+        let target = HWND(target_hwnd as *mut _);
+        if !unsafe { IsWindow(target) }.as_bool() || unsafe { GetForegroundWindow() } != target {
+            return FocusedDocumentTypeOutcome::NotApplicable;
+        }
+        let Some(target_pid) = native_window_pid(target) else {
+            return FocusedDocumentTypeOutcome::NotApplicable;
+        };
+        if expected_pid.is_some_and(|pid| pid != target_pid) {
+            return FocusedDocumentTypeOutcome::NotApplicable;
+        }
+
+        let Ok(uia) = (unsafe {
+            CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+        }) else {
+            return FocusedDocumentTypeOutcome::NotApplicable;
+        };
+        let Ok(focused) = (unsafe { uia.GetFocusedElement() }) else {
+            return FocusedDocumentTypeOutcome::NotApplicable;
+        };
+        if !focused_document_matches_target(&focused, target, target_pid) {
+            return FocusedDocumentTypeOutcome::NotApplicable;
+        }
+
+        let Ok(value_pattern) = (unsafe { focused.GetCurrentPattern(UIA_ValuePatternId) }) else {
+            return FocusedDocumentTypeOutcome::NotApplicable;
+        };
+        let Ok(value_pattern) = value_pattern.cast::<IUIAutomationValuePattern>() else {
+            return FocusedDocumentTypeOutcome::NotApplicable;
+        };
+        let writable_empty_value = unsafe { value_pattern.CurrentIsReadOnly() }
+            .is_ok_and(|read_only| !read_only.as_bool())
+            && unsafe { value_pattern.CurrentValue() }
+                .is_ok_and(|value| value.to_string().is_empty());
+
+        let Ok(text_pattern) = (unsafe { focused.GetCurrentPattern(UIA_TextPatternId) }) else {
+            return FocusedDocumentTypeOutcome::NotApplicable;
+        };
+        let Ok(text_pattern) = text_pattern.cast::<IUIAutomationTextPattern>() else {
+            return FocusedDocumentTypeOutcome::NotApplicable;
+        };
+        let single_text_selection = unsafe { text_pattern.SupportedTextSelection() }
+            .is_ok_and(|selection| selection == SupportedTextSelection_Single);
+        let Ok(_initial_document_range) = (unsafe { text_pattern.DocumentRange() }) else {
+            return FocusedDocumentTypeOutcome::NotApplicable;
+        };
+        if !focused_document_eligible(
+            unsafe { GetForegroundWindow() } == target
+                && native_window_pid(target) == Some(target_pid),
+            writable_empty_value,
+            single_text_selection,
+        ) {
+            return FocusedDocumentTypeOutcome::NotApplicable;
+        }
+        let Ok(focused_before_write) = (unsafe { uia.GetFocusedElement() }) else {
+            return FocusedDocumentTypeOutcome::NotApplicable;
+        };
+        if unsafe { GetForegroundWindow() } != target
+            || native_window_pid(target) != Some(target_pid)
+            || !unsafe { uia.CompareElements(&focused, &focused_before_write) }
+                .is_ok_and(|same| same.as_bool())
+            || !focused_document_matches_target(&focused_before_write, target, target_pid)
+        {
+            return FocusedDocumentTypeOutcome::NotApplicable;
+        }
+        if !unsafe { value_pattern.CurrentIsReadOnly() }
+            .is_ok_and(|read_only| !read_only.as_bool())
+            || !unsafe { value_pattern.CurrentValue() }
+                .is_ok_and(|value| value.to_string().is_empty())
+        {
+            return FocusedDocumentTypeOutcome::NotApplicable;
+        }
+
+        let attempted = true;
+        let write_result = (|| -> Result<(), &'static str> {
+            let value = BSTR::from(text);
+            unsafe { value_pattern.SetValue(&value) }
+                .map_err(|_| "ValuePattern.SetValue failed after dispatch")?;
+            let actual_value = unsafe { value_pattern.CurrentValue() }
+                .map_err(|_| "ValuePattern read-back failed after dispatch")?;
+            if !normalized_text_matches(text, &actual_value.to_string()) {
+                return Err("ValuePattern read-back did not match after dispatch");
+            }
+
+            let document_range = unsafe { text_pattern.DocumentRange() }
+                .map_err(|_| "TextPattern DocumentRange failed after dispatch")?;
+            let caret_range = unsafe { document_range.Clone() }
+                .map_err(|_| "TextPattern range clone failed after dispatch")?;
+            unsafe {
+                caret_range.MoveEndpointByRange(
+                    TextPatternRangeEndpoint_Start,
+                    &document_range,
+                    TextPatternRangeEndpoint_End,
+                )
+            }
+            .map_err(|_| "TextPattern caret collapse failed after dispatch")?;
+            unsafe { caret_range.Select() }
+                .map_err(|_| "TextPattern caret placement failed after dispatch")?;
+
+            let fresh_document_range = unsafe { text_pattern.DocumentRange() }
+                .map_err(|_| "TextPattern verification range failed after dispatch")?;
+            let selections = unsafe { text_pattern.GetSelection() }
+                .map_err(|_| "TextPattern selection read-back failed after dispatch")?;
+            if unsafe { selections.Length() }
+                .map_err(|_| "TextPattern selection count failed after dispatch")?
+                != 1
+            {
+                return Err("TextPattern did not report exactly one caret after dispatch");
+            }
+            let selection = unsafe { selections.GetElement(0) }
+                .map_err(|_| "TextPattern caret read-back failed after dispatch")?;
+            let start_at_end = unsafe {
+                selection.CompareEndpoints(
+                    TextPatternRangeEndpoint_Start,
+                    &fresh_document_range,
+                    TextPatternRangeEndpoint_End,
+                )
+            }
+            .map_err(|_| "TextPattern caret start comparison failed after dispatch")?;
+            let end_at_end = unsafe {
+                selection.CompareEndpoints(
+                    TextPatternRangeEndpoint_End,
+                    &fresh_document_range,
+                    TextPatternRangeEndpoint_End,
+                )
+            }
+            .map_err(|_| "TextPattern caret end comparison failed after dispatch")?;
+            if start_at_end != 0 || end_at_end != 0 {
+                return Err("TextPattern caret was not at the document end after dispatch");
+            }
+            let final_value = unsafe { value_pattern.CurrentValue() }
+                .map_err(|_| "Final ValuePattern read-back failed after dispatch")?;
+            if !normalized_text_matches(text, &final_value.to_string()) {
+                return Err("ValuePattern changed during caret placement");
+            }
+
+            if unsafe { GetForegroundWindow() } != target
+                || native_window_pid(target) != Some(target_pid)
+            {
+                return Err("Foreground identity changed after dispatch");
+            }
+            let focused_after = unsafe { uia.GetFocusedElement() }
+                .map_err(|_| "Focused element read-back failed after dispatch")?;
+            let same_element = unsafe { uia.CompareElements(&focused, &focused_after) }
+                .map_err(|_| "Focused element identity comparison failed after dispatch")?;
+            if !same_element.as_bool()
+                || !focused_document_matches_target(&focused_after, target, target_pid)
+            {
+                return Err("Focused Document target changed after dispatch");
+            }
+            Ok(())
+        })();
+        classify_focused_document_write(attempted, write_result)
+    })();
+
+    unsafe { CoUninitialize() };
+    outcome
+}
+
+fn focused_document_tool_result(
+    outcome: FocusedDocumentTypeOutcome,
+    text_len: usize,
+) -> Option<ToolResult> {
+    match outcome {
+        FocusedDocumentTypeOutcome::NotApplicable => None,
+        FocusedDocumentTypeOutcome::Confirmed => Some(
+            ToolResult::text(format!(
+                "Wrote and verified {text_len} character(s) in the focused Document; caret is at the document end."
+            ))
+            .with_structured(value_write_structured_result(text_len, "confirmed", true)),
+        ),
+        FocusedDocumentTypeOutcome::Unknown(stage) => Some(ToolResult::error(format!(
+            "foreground_input_outcome_unknown: {stage}; text may have been written; inspect the document before retrying"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod focused_document_type_tests {
+    use super::{
+        classify_focused_document_write, focused_document_eligible, normalized_text_matches,
+        normalize_document_line_endings, FocusedDocumentTypeOutcome,
+    };
+
+    #[test]
+    fn focused_document_requires_every_safe_precondition() {
+        assert!(focused_document_eligible(true, true, true));
+        assert!(!focused_document_eligible(false, true, true));
+        assert!(!focused_document_eligible(true, false, true));
+        assert!(!focused_document_eligible(true, true, false));
+    }
+
+    #[test]
+    fn only_a_verified_post_write_state_is_confirmed() {
+        assert_eq!(
+            classify_focused_document_write(false, Err("probe failed")),
+            FocusedDocumentTypeOutcome::NotApplicable
+        );
+        assert_eq!(
+            classify_focused_document_write(true, Err("caret failed")),
+            FocusedDocumentTypeOutcome::Unknown("caret failed")
+        );
+        assert_eq!(
+            classify_focused_document_write(true, Ok(())),
+            FocusedDocumentTypeOutcome::Confirmed
+        );
+    }
+
+    #[test]
+    fn line_ending_normalization_preserves_blank_lines_and_content() {
+        assert_eq!(
+            normalize_document_line_endings("one\r\n\r\ntwo\rthree\n"),
+            "one\n\ntwo\nthree\n"
+        );
+        assert!(normalized_text_matches("one\r\n\r\ntwo\rthree", "one\n\ntwo\nthree"));
+        assert!(!normalized_text_matches("one\n\ntwo", "one\ntwo"));
+    }
 }
 
 fn changed_contains_post_message_result(text_len: usize) -> serde_json::Value {
