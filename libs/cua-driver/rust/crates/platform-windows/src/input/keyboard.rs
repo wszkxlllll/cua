@@ -471,7 +471,7 @@ pub fn send_key_synthesized_after_focus(
         events.push(key_input(*mvk, true));
     }
 
-    with_confirmed_foreground(target, "key delivery", focus, || unsafe {
+    with_confirmed_foreground(target, "key delivery", focus, |_| unsafe {
         let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
         if sent as usize != events.len() {
             bail!(
@@ -515,51 +515,125 @@ pub fn send_text_synthesized_after_focus(
     if let Some(msg) = crate::input::post_message_blocked_by_uipi(hwnd) {
         bail!(msg);
     }
-    // Build the key-event sequence. Printable codepoints go through as Unicode
-    // packets (KEYEVENTF_UNICODE, wVk=0, wScan=code unit), but line breaks are
-    // mapped to a real VK_RETURN keystroke — mirroring the background path
-    // (`post_enter_keystroke`) — because terminals and rich editors honour an
-    // Enter key event, not a raw `\r`/`\n` Unicode packet. `\r\n` collapses to
-    // a single Return (the `\r` emits the Enter; the following `\n` is silent).
-    let return_vk = windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
-    let mut events: Vec<INPUT> = Vec::with_capacity(text.len() * 2);
-    let mut prev_was_cr = false;
-    for ch in text.chars() {
-        match ch {
-            '\n' if prev_was_cr => {
-                prev_was_cr = false;
-            }
-            '\n' | '\r' => {
-                events.push(key_input(return_vk, false));
-                events.push(key_input(return_vk, true));
-                prev_was_cr = ch == '\r';
-            }
-            _ => {
-                prev_was_cr = false;
-                let mut buf = [0u16; 2];
-                for unit in ch.encode_utf16(&mut buf) {
-                    events.push(unicode_key_input(*unit, false));
-                    events.push(unicode_key_input(*unit, true));
-                }
-            }
-        }
-    }
-    if events.is_empty() {
+    let scalars = text_input_scalars(text);
+    if scalars.is_empty() {
         return Ok(());
     }
 
-    with_confirmed_foreground(target, "text delivery", focus, || unsafe {
-        let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
-        if sent as usize != events.len() {
-            bail!(
-                "SendInput inserted only {sent} of {} key events. Likely cause: \
-                 the daemon is not at UIAccess integrity, so SetForegroundWindow \
-                 was rejected and the events landed on the wrong window.",
-                events.len()
-            );
+    let mut sent_any = false;
+    let mut delivery_error = None;
+    with_confirmed_foreground(target, "text delivery", focus, |confirmed_foreground| {
+        let mut target_pid = 0;
+        if unsafe { GetWindowThreadProcessId(target, Some(&mut target_pid)) } == 0
+            || target_pid == 0
+            || !foreground_matches_exact_window(confirmed_foreground, target_pid)
+        {
+            return Err(foreground_text_drift_error(false));
+        }
+
+        for (index, scalar) in scalars.iter().copied().enumerate() {
+            if !foreground_matches_exact_window(confirmed_foreground, target_pid) {
+                if sent_any {
+                    delivery_error = Some(foreground_text_drift_error(true));
+                    break;
+                }
+                return Err(foreground_text_drift_error(false));
+            }
+
+            let events = text_character_inputs(scalar);
+            let earlier_input_sent = sent_any;
+            let sent = unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) };
+            if sent as usize != events.len() {
+                let error = partial_text_send_error(sent, events.len(), earlier_input_sent);
+                if earlier_input_sent || sent > 0 {
+                    sent_any |= sent > 0;
+                    delivery_error = Some(error);
+                    break;
+                }
+                return Err(error);
+            }
+
+            sent_any = true;
+            if index + 1 < scalars.len() {
+                sleep(FOREGROUND_TEXT_SCALAR_DELAY);
+            }
+            if !foreground_matches_exact_window(confirmed_foreground, target_pid) {
+                delivery_error = Some(foreground_text_drift_error(true));
+                break;
+            }
         }
         Ok(())
-    })
+    })?;
+
+    if let Some(error) = delivery_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+const FOREGROUND_TEXT_SCALAR_DELAY: Duration = Duration::from_millis(20);
+
+fn text_input_scalars(text: &str) -> Vec<char> {
+    let mut scalars = Vec::with_capacity(text.chars().count());
+    let mut previous_was_cr = false;
+    for scalar in text.chars() {
+        if scalar == '\n' && previous_was_cr {
+            previous_was_cr = false;
+            continue;
+        }
+        scalars.push(scalar);
+        previous_was_cr = scalar == '\r';
+    }
+    scalars
+}
+
+fn text_character_inputs(scalar: char) -> Vec<INPUT> {
+    if matches!(scalar, '\r' | '\n') {
+        let return_vk = windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+        return vec![key_input(return_vk, false), key_input(return_vk, true)];
+    }
+
+    let mut events = Vec::with_capacity(4);
+    let mut utf16 = [0u16; 2];
+    for unit in scalar.encode_utf16(&mut utf16) {
+        events.push(unicode_key_input(*unit, false));
+        events.push(unicode_key_input(*unit, true));
+    }
+    events
+}
+
+fn foreground_matches_exact_window(expected_hwnd: HWND, expected_pid: u32) -> bool {
+    let actual = unsafe { GetForegroundWindow() };
+    if actual != expected_hwnd {
+        return false;
+    }
+    let mut actual_pid = 0;
+    unsafe { GetWindowThreadProcessId(actual, Some(&mut actual_pid)) } != 0
+        && actual_pid == expected_pid
+}
+
+fn partial_text_send_error(sent: u32, required: usize, earlier_input_sent: bool) -> anyhow::Error {
+    if earlier_input_sent || sent > 0 {
+        anyhow::anyhow!(
+            "foreground_input_outcome_unknown: SendInput inserted {sent} of {required} events for the current Unicode scalar. Earlier text may already have been delivered; the driver stopped without replaying the remaining suffix."
+        )
+    } else {
+        anyhow::anyhow!(
+            "SendInput inserted 0 of {required} events for the first Unicode scalar; no input was sent."
+        )
+    }
+}
+
+fn foreground_text_drift_error(earlier_input_sent: bool) -> anyhow::Error {
+    if earlier_input_sent {
+        anyhow::anyhow!(
+            "foreground_input_outcome_unknown: the exact foreground HWND or PID changed during text delivery. Earlier text may already have been delivered; the remaining suffix was not sent."
+        )
+    } else {
+        anyhow::anyhow!(
+            "foreground_unavailable: the exact foreground HWND or PID changed before the first text scalar; no input was sent."
+        )
+    }
 }
 
 fn wait_for_exact_foreground(target: HWND, timeout: Duration) -> bool {
@@ -585,7 +659,7 @@ fn with_confirmed_foreground<T>(
     target: HWND,
     operation: &str,
     focus: impl FnOnce() -> Result<()>,
-    body: impl FnOnce() -> Result<T>,
+    body: impl FnOnce(HWND) -> Result<T>,
 ) -> Result<T> {
     let previous = unsafe { GetForegroundWindow() };
     let _ = unsafe { crate::input::force_foreground_assisted(target) };
@@ -643,7 +717,7 @@ fn with_confirmed_foreground<T>(
                 actual.0
             );
         }
-        body()
+        body(actual)
     })();
 
     // Give the target message loop a bounded opportunity to consume the
@@ -816,4 +890,98 @@ fn key_name_to_vk(key: &str) -> Result<VIRTUAL_KEY> {
         }
     };
     Ok(vk)
+}
+
+#[cfg(test)]
+mod foreground_text_tests {
+    use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_RETURN};
+
+    fn key_event(input: &INPUT) -> KEYBDINPUT {
+        unsafe { input.Anonymous.ki }
+    }
+
+    fn assert_unicode_pair(events: &[INPUT], index: usize, unit: u16) {
+        let down = key_event(&events[index * 2]);
+        let up = key_event(&events[index * 2 + 1]);
+        assert_eq!(down.wScan, unit);
+        assert_eq!(up.wScan, unit);
+        assert_ne!(down.dwFlags.0 & KEYEVENTF_UNICODE.0, 0);
+        assert_ne!(up.dwFlags.0 & KEYEVENTF_UNICODE.0, 0);
+        assert_eq!(down.dwFlags.0 & KEYEVENTF_KEYUP.0, 0);
+        assert_ne!(up.dwFlags.0 & KEYEVENTF_KEYUP.0, 0);
+    }
+
+    #[test]
+    fn foreground_text_uses_measured_twenty_millisecond_scalar_spacing() {
+        assert_eq!(FOREGROUND_TEXT_SCALAR_DELAY, Duration::from_millis(20));
+    }
+
+    #[test]
+    fn text_scalars_collapse_crlf_but_preserve_lone_line_breaks() {
+        assert_eq!(
+            text_input_scalars("a\r\nb\nc\r"),
+            vec!['a', '\r', 'b', '\n', 'c', '\r']
+        );
+    }
+
+    #[test]
+    fn bmp_scalar_is_one_unicode_down_up_group() {
+        let events = text_character_inputs('\u{4e00}');
+        assert_eq!(events.len(), 2);
+        assert_unicode_pair(&events, 0, 0x4e00);
+    }
+
+    #[test]
+    fn supplementary_scalar_keeps_both_surrogates_in_one_group() {
+        let mut encoded = [0u16; 2];
+        let units = '\u{1f9ea}'.encode_utf16(&mut encoded);
+        let events = text_character_inputs('\u{1f9ea}');
+        assert_eq!(units.len(), 2);
+        assert_eq!(events.len(), 4);
+        assert_unicode_pair(&events, 0, units[0]);
+        assert_unicode_pair(&events, 1, units[1]);
+    }
+
+    #[test]
+    fn line_break_is_the_existing_scancode_return_pair() {
+        let expected_down = key_input(VK_RETURN, false);
+        let expected_up = key_input(VK_RETURN, true);
+        for scalar in ['\r', '\n'] {
+            let events = text_character_inputs(scalar);
+            assert_eq!(events.len(), 2);
+            let down = key_event(&events[0]);
+            let up = key_event(&events[1]);
+            assert_eq!(down.wScan, key_event(&expected_down).wScan);
+            assert_eq!(up.wScan, key_event(&expected_up).wScan);
+            assert_eq!(down.dwFlags, key_event(&expected_down).dwFlags);
+            assert_eq!(up.dwFlags, key_event(&expected_up).dwFlags);
+        }
+    }
+
+    #[test]
+    fn partial_send_after_prefix_is_unknown_and_not_replayed() {
+        let error = partial_text_send_error(1, 2, true).to_string();
+        assert!(error.starts_with("foreground_input_outcome_unknown:"));
+        assert!(error.contains("Earlier text may already have been delivered"));
+        assert!(error.contains("without replaying the remaining suffix"));
+
+        let first_zero = partial_text_send_error(0, 2, false).to_string();
+        assert!(!first_zero.starts_with("foreground_input_outcome_unknown:"));
+        assert!(first_zero.contains("no input was sent"));
+
+        let first_partial = partial_text_send_error(1, 2, false).to_string();
+        assert!(first_partial.starts_with("foreground_input_outcome_unknown:"));
+    }
+
+    #[test]
+    fn foreground_drift_only_claims_no_input_before_the_first_scalar() {
+        let after_prefix = foreground_text_drift_error(true).to_string();
+        assert!(after_prefix.starts_with("foreground_input_outcome_unknown:"));
+        assert!(after_prefix.contains("remaining suffix was not sent"));
+
+        let before_first = foreground_text_drift_error(false).to_string();
+        assert!(before_first.starts_with("foreground_unavailable:"));
+        assert!(before_first.contains("no input was sent"));
+    }
 }
