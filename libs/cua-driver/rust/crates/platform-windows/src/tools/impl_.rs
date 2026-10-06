@@ -4734,8 +4734,8 @@ fn try_type_focused_empty_document(
         COINIT_APARTMENTTHREADED,
     };
     use windows::Win32::UI::Accessibility::{
-        CUIAutomation, IUIAutomation, IUIAutomationTextPattern,
-        IUIAutomationValuePattern, SupportedTextSelection_Single, TextPatternRangeEndpoint_End,
+        CUIAutomation, IUIAutomation, IUIAutomationTextPattern, IUIAutomationValuePattern,
+        SupportedTextSelection_Single, TextPatternRangeEndpoint_End,
         TextPatternRangeEndpoint_Start, UIA_TextPatternId, UIA_ValuePatternId,
     };
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsWindow};
@@ -4813,8 +4813,7 @@ fn try_type_focused_empty_document(
         {
             return FocusedDocumentTypeOutcome::NotApplicable;
         }
-        if !unsafe { value_pattern.CurrentIsReadOnly() }
-            .is_ok_and(|read_only| !read_only.as_bool())
+        if !unsafe { value_pattern.CurrentIsReadOnly() }.is_ok_and(|read_only| !read_only.as_bool())
             || !unsafe { value_pattern.CurrentValue() }
                 .is_ok_and(|value| value.to_string().is_empty())
         {
@@ -4928,8 +4927,8 @@ fn focused_document_tool_result(
 #[cfg(test)]
 mod focused_document_type_tests {
     use super::{
-        classify_focused_document_write, focused_document_eligible, normalized_text_matches,
-        normalize_document_line_endings, FocusedDocumentTypeOutcome,
+        classify_focused_document_write, focused_document_eligible,
+        normalize_document_line_endings, normalized_text_matches, FocusedDocumentTypeOutcome,
     };
 
     #[test]
@@ -4962,7 +4961,10 @@ mod focused_document_type_tests {
             normalize_document_line_endings("one\r\n\r\ntwo\rthree\n"),
             "one\n\ntwo\nthree\n"
         );
-        assert!(normalized_text_matches("one\r\n\r\ntwo\rthree", "one\n\ntwo\nthree"));
+        assert!(normalized_text_matches(
+            "one\r\n\r\ntwo\rthree",
+            "one\n\ntwo\nthree"
+        ));
         assert!(!normalized_text_matches("one\n\ntwo", "one\ntwo"));
     }
 }
