@@ -635,7 +635,7 @@ fn with_confirmed_foreground<T>(
     target: HWND,
     operation: &str,
     focus: impl FnOnce() -> Result<()>,
-    body: impl FnOnce(crate::win32::ForegroundTarget) -> Result<T>,
+    body: impl FnOnce(crate::win32::windows::ForegroundTarget) -> Result<T>,
 ) -> Result<T> {
     let previous = unsafe { GetForegroundWindow() };
     let _ = unsafe { crate::input::force_foreground_assisted(target) };
