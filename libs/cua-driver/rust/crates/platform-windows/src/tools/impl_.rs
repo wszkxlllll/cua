@@ -4686,6 +4686,21 @@ fn focused_document_eligible(
     exact_target && writable_empty_value && single_text_selection
 }
 
+fn focused_document_not_applicable(
+    thread_id: u32,
+    coinit_hresult: Option<i32>,
+    stage: &'static str,
+) -> FocusedDocumentTypeOutcome {
+    tracing::debug!(
+        target: "focused_document_type",
+        thread_id = thread_id,
+        coinit_hresult = ?(coinit_hresult.map(|hr| format!("0x{:08X}", hr as u32))),
+        stage = stage,
+        "focused UIA type path not applicable"
+    );
+    FocusedDocumentTypeOutcome::NotApplicable
+}
+
 fn native_window_pid(hwnd: windows::Win32::Foundation::HWND) -> Option<u32> {
     use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
     if hwnd.0.is_null() {
@@ -4731,8 +4746,9 @@ fn try_type_focused_empty_document(
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED,
+        COINIT_MULTITHREADED,
     };
+    use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Accessibility::{
         CUIAutomation, IUIAutomation, IUIAutomationTextPattern, IUIAutomationValuePattern,
         SupportedTextSelection_Single, TextPatternRangeEndpoint_End,
@@ -4740,43 +4756,53 @@ fn try_type_focused_empty_document(
     };
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsWindow};
 
+    let thread_id = unsafe { GetCurrentThreadId() };
     if text.is_empty() {
-        return FocusedDocumentTypeOutcome::NotApplicable;
+        return focused_document_not_applicable(thread_id, None, "empty_input");
     }
-    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
-    if !initialized {
-        return FocusedDocumentTypeOutcome::NotApplicable;
+    // UI Automation client calls run on this windowless blocking worker; use
+    // MTA, which is also the mode used by the other UIA worker paths.
+    let coinit_result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    if coinit_result.is_err() {
+        return focused_document_not_applicable(
+            thread_id,
+            Some(coinit_result.0),
+            "co_initialize_failed",
+        );
     }
+    let not_applicable = |stage: &'static str| {
+        focused_document_not_applicable(thread_id, Some(coinit_result.0), stage)
+    };
 
     let outcome = (|| {
         let target = HWND(target_hwnd as *mut _);
         if !unsafe { IsWindow(target) }.as_bool() || unsafe { GetForegroundWindow() } != target {
-            return FocusedDocumentTypeOutcome::NotApplicable;
+            return not_applicable("target_not_foreground_or_invalid");
         }
         let Some(target_pid) = native_window_pid(target) else {
-            return FocusedDocumentTypeOutcome::NotApplicable;
+            return not_applicable("target_pid_unavailable");
         };
         if expected_pid.is_some_and(|pid| pid != target_pid) {
-            return FocusedDocumentTypeOutcome::NotApplicable;
+            return not_applicable("target_pid_mismatch");
         }
 
         let Ok(uia) = (unsafe {
             CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
         }) else {
-            return FocusedDocumentTypeOutcome::NotApplicable;
+            return not_applicable("uia_create_failed");
         };
         let Ok(focused) = (unsafe { uia.GetFocusedElement() }) else {
-            return FocusedDocumentTypeOutcome::NotApplicable;
+            return not_applicable("focused_element_unavailable");
         };
         if !focused_document_matches_target(&focused, target, target_pid) {
-            return FocusedDocumentTypeOutcome::NotApplicable;
+            return not_applicable("focused_element_not_exact_document");
         }
 
         let Ok(value_pattern) = (unsafe { focused.GetCurrentPattern(UIA_ValuePatternId) }) else {
-            return FocusedDocumentTypeOutcome::NotApplicable;
+            return not_applicable("value_pattern_unavailable");
         };
         let Ok(value_pattern) = value_pattern.cast::<IUIAutomationValuePattern>() else {
-            return FocusedDocumentTypeOutcome::NotApplicable;
+            return not_applicable("value_pattern_cast_failed");
         };
         let writable_empty_value = unsafe { value_pattern.CurrentIsReadOnly() }
             .is_ok_and(|read_only| !read_only.as_bool())
@@ -4784,15 +4810,15 @@ fn try_type_focused_empty_document(
                 .is_ok_and(|value| value.to_string().is_empty());
 
         let Ok(text_pattern) = (unsafe { focused.GetCurrentPattern(UIA_TextPatternId) }) else {
-            return FocusedDocumentTypeOutcome::NotApplicable;
+            return not_applicable("text_pattern_unavailable");
         };
         let Ok(text_pattern) = text_pattern.cast::<IUIAutomationTextPattern>() else {
-            return FocusedDocumentTypeOutcome::NotApplicable;
+            return not_applicable("text_pattern_cast_failed");
         };
         let single_text_selection = unsafe { text_pattern.SupportedTextSelection() }
             .is_ok_and(|selection| selection == SupportedTextSelection_Single);
         let Ok(_initial_document_range) = (unsafe { text_pattern.DocumentRange() }) else {
-            return FocusedDocumentTypeOutcome::NotApplicable;
+            return not_applicable("document_range_unavailable");
         };
         if !focused_document_eligible(
             unsafe { GetForegroundWindow() } == target
@@ -4800,10 +4826,10 @@ fn try_type_focused_empty_document(
             writable_empty_value,
             single_text_selection,
         ) {
-            return FocusedDocumentTypeOutcome::NotApplicable;
+            return not_applicable("initial_eligibility_not_met");
         }
         let Ok(focused_before_write) = (unsafe { uia.GetFocusedElement() }) else {
-            return FocusedDocumentTypeOutcome::NotApplicable;
+            return not_applicable("focused_element_changed_before_write");
         };
         if unsafe { GetForegroundWindow() } != target
             || native_window_pid(target) != Some(target_pid)
@@ -4811,13 +4837,13 @@ fn try_type_focused_empty_document(
                 .is_ok_and(|same| same.as_bool())
             || !focused_document_matches_target(&focused_before_write, target, target_pid)
         {
-            return FocusedDocumentTypeOutcome::NotApplicable;
+            return not_applicable("target_or_focus_changed_before_write");
         }
         if !unsafe { value_pattern.CurrentIsReadOnly() }.is_ok_and(|read_only| !read_only.as_bool())
             || !unsafe { value_pattern.CurrentValue() }
                 .is_ok_and(|value| value.to_string().is_empty())
         {
-            return FocusedDocumentTypeOutcome::NotApplicable;
+            return not_applicable("value_not_empty_before_write");
         }
 
         let attempted = true;
@@ -4902,6 +4928,8 @@ fn try_type_focused_empty_document(
         classify_focused_document_write(attempted, write_result)
     })();
 
+    // S_OK and S_FALSE both increment this thread's COM initialization count;
+    // balance this call after the closure has dropped its UIA interfaces.
     unsafe { CoUninitialize() };
     outcome
 }
