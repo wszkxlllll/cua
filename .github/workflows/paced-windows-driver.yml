@@ -25,8 +25,10 @@ jobs:
             /libs/cua/Cargo.toml
             /libs/cua/crates/*/Cargo.toml
             /libs/cua/crates/cua-telemetry/**
+            /libs/cua/crates/cua-teleport/src/ux/targets.json
             /libs/fleet/sdk/Cargo.toml
             /libs/fleet/sdk-schema/Cargo.toml
+            /libs/images/sandbox-images.json
 
       - name: Build the pinned Windows release binary
         shell: pwsh
