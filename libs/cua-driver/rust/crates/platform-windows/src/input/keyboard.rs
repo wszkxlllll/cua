@@ -524,7 +524,8 @@ pub fn send_text_synthesized_after_focus(
     let mut delivery_error = None;
     with_confirmed_foreground(target, "text delivery", focus, |confirmed_foreground| {
         let mut target_pid = 0;
-        if unsafe { GetWindowThreadProcessId(target, Some(&mut target_pid)) } == 0
+        let target_thread = unsafe { GetWindowThreadProcessId(target, Some(&mut target_pid)) };
+        if target_thread == 0
             || target_pid == 0
             || !foreground_matches_exact_window(confirmed_foreground, target_pid)
         {
@@ -608,8 +609,8 @@ fn foreground_matches_exact_window(expected_hwnd: HWND, expected_pid: u32) -> bo
         return false;
     }
     let mut actual_pid = 0;
-    unsafe { GetWindowThreadProcessId(actual, Some(&mut actual_pid)) } != 0
-        && actual_pid == expected_pid
+    let actual_thread = unsafe { GetWindowThreadProcessId(actual, Some(&mut actual_pid)) };
+    actual_thread != 0 && actual_pid == expected_pid
 }
 
 fn partial_text_send_error(sent: u32, required: usize, earlier_input_sent: bool) -> anyhow::Error {
@@ -895,7 +896,9 @@ fn key_name_to_vk(key: &str) -> Result<VIRTUAL_KEY> {
 #[cfg(test)]
 mod foreground_text_tests {
     use super::*;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_RETURN};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_RETURN,
+    };
 
     fn key_event(input: &INPUT) -> KEYBDINPUT {
         unsafe { input.Anonymous.ki }
