@@ -572,7 +572,7 @@ pub fn send_text_synthesized_after_focus(
     Ok(())
 }
 
-const FOREGROUND_TEXT_SCALAR_DELAY: Duration = Duration::from_millis(20);
+const FOREGROUND_TEXT_SCALAR_DELAY: Duration = Duration::from_millis(40);
 
 fn text_input_scalars(text: &str) -> Vec<char> {
     let mut scalars = Vec::with_capacity(text.chars().count());
@@ -916,8 +916,8 @@ mod foreground_text_tests {
     }
 
     #[test]
-    fn foreground_text_uses_measured_twenty_millisecond_scalar_spacing() {
-        assert_eq!(FOREGROUND_TEXT_SCALAR_DELAY, Duration::from_millis(20));
+    fn foreground_text_uses_measured_forty_millisecond_scalar_spacing() {
+        assert_eq!(FOREGROUND_TEXT_SCALAR_DELAY, Duration::from_millis(40));
     }
 
     #[test]
