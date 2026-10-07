@@ -4001,7 +4001,7 @@ impl Tool for TypeTextTool {
             // first, falls back to character-by-character CGEvent synthesis.
             // Windows uses character-by-character PostMessage(WM_CHAR) to the
             // window's focused child, with a capability-gated UIA path for a
-            // focused empty Document on foreground delivery.
+            // focused writable Document on foreground delivery.
             description: "Insert text into the target pid via character-by-character \
                 PostMessage(WM_CHAR) to the focused window. No focus steal.\n\n\
                 Special keys (Return, Escape, arrows, Tab) go through `press_key` / \
@@ -4015,9 +4015,11 @@ impl Tool for TypeTextTool {
                 the system input queue), so the fallback path silently dropped chars. \
                 If you call `type_text(pid, text)` on a XAML host without `element_index`, \
                 the tool returns an actionable error pointing you at `get_window_state` \
-                first. Foreground delivery may instead use a focused, empty, writable \
-                Document that exposes TextPattern with single selection; the tool writes \
-                the value, moves the caret to its end, and verifies both. This does not \
+                first. Foreground delivery may instead use a focused, writable Document \
+                that exposes ValuePattern and TextPattern with single selection. It is \
+                eligible when empty, or when its collapsed caret is already at the document \
+                end; the tool writes the value, moves the caret to its end, and verifies both. \
+                This focused-Document path replaces the full ValuePattern value and does not \
                 apply to single-line Edit controls. Native ConsoleHost on Windows ARM64 is hard-refused because it can \
                 accept synthesized Unicode events without delivering them; use a process \
                 or PTY setup channel instead. Legacy Win32 apps still use the PostMessage \
@@ -4072,7 +4074,7 @@ impl Tool for TypeTextTool {
             {
                 let uia_text = text.clone();
                 match tokio::task::spawn_blocking(move || {
-                    try_type_focused_empty_document(hwnd, None, &uia_text)
+                    try_type_focused_document_append(hwnd, None, &uia_text)
                 })
                 .await
                 {
@@ -4276,7 +4278,7 @@ impl Tool for TypeTextTool {
             if elem_idx.is_none() && args.get("x").is_none() && args.get("y").is_none() {
                 let uia_text = text.clone();
                 match tokio::task::spawn_blocking(move || {
-                    try_type_focused_empty_document(hwnd, Some(pid), &uia_text)
+                    try_type_focused_document_append(hwnd, Some(pid), &uia_text)
                 })
                 .await
                 {
@@ -4678,12 +4680,27 @@ fn normalized_text_matches(expected: &str, actual: &str) -> bool {
     normalize_document_line_endings(expected) == normalize_document_line_endings(actual)
 }
 
+fn focused_document_appended_value(current_value: &str, input: &str) -> String {
+    if current_value.is_empty() {
+        return input.to_owned();
+    }
+
+    let mut value = normalize_document_line_endings(current_value);
+    value.push_str(&normalize_document_line_endings(input));
+    value
+}
+
 fn focused_document_eligible(
     exact_target: bool,
-    writable_empty_value: bool,
+    writable_value: bool,
+    value_is_empty: bool,
     single_text_selection: bool,
+    collapsed_caret_at_end: bool,
 ) -> bool {
-    exact_target && writable_empty_value && single_text_selection
+    exact_target
+        && writable_value
+        && single_text_selection
+        && (value_is_empty || collapsed_caret_at_end)
 }
 
 fn focused_document_not_applicable(
@@ -4735,9 +4752,44 @@ fn focused_document_matches_target(
         && unsafe { GetAncestor(hwnd, GA_ROOT) } == target
 }
 
-/// Opportunistically type into an exact focused empty Document. Ineligible
-/// states preserve the caller's route; post-SetValue failures are unknown.
-fn try_type_focused_empty_document(
+fn text_pattern_caret_at_document_end(
+    text_pattern: &windows::Win32::UI::Accessibility::IUIAutomationTextPattern,
+) -> Result<bool, &'static str> {
+    use windows::Win32::UI::Accessibility::{
+        TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start,
+    };
+
+    let document_range =
+        unsafe { text_pattern.DocumentRange() }.map_err(|_| "document_range_unavailable")?;
+    let selections = unsafe { text_pattern.GetSelection() }.map_err(|_| "selection_unavailable")?;
+    if unsafe { selections.Length() }.map_err(|_| "selection_count_unavailable")? != 1 {
+        return Ok(false);
+    }
+    let selection =
+        unsafe { selections.GetElement(0) }.map_err(|_| "selection_range_unavailable")?;
+    let start_at_end = unsafe {
+        selection.CompareEndpoints(
+            TextPatternRangeEndpoint_Start,
+            &document_range,
+            TextPatternRangeEndpoint_End,
+        )
+    }
+    .map_err(|_| "selection_start_comparison_unavailable")?;
+    let end_at_end = unsafe {
+        selection.CompareEndpoints(
+            TextPatternRangeEndpoint_End,
+            &document_range,
+            TextPatternRangeEndpoint_End,
+        )
+    }
+    .map_err(|_| "selection_end_comparison_unavailable")?;
+    Ok(start_at_end == 0 && end_at_end == 0)
+}
+
+/// Opportunistically append to an exact focused Document. A nonempty document
+/// qualifies only with one collapsed caret at its end. Ineligible states
+/// preserve the caller's route; post-SetValue failures are unknown.
+fn try_type_focused_document_append(
     target_hwnd: u64,
     expected_pid: Option<u32>,
     text: &str,
@@ -4804,10 +4856,14 @@ fn try_type_focused_empty_document(
         let Ok(value_pattern) = value_pattern.cast::<IUIAutomationValuePattern>() else {
             return not_applicable("value_pattern_cast_failed");
         };
-        let writable_empty_value = unsafe { value_pattern.CurrentIsReadOnly() }
-            .is_ok_and(|read_only| !read_only.as_bool())
-            && unsafe { value_pattern.CurrentValue() }
-                .is_ok_and(|value| value.to_string().is_empty());
+        let Ok(initial_read_only) = (unsafe { value_pattern.CurrentIsReadOnly() }) else {
+            return not_applicable("value_read_only_state_unavailable");
+        };
+        let Ok(initial_value) = (unsafe { value_pattern.CurrentValue() }) else {
+            return not_applicable("value_unavailable");
+        };
+        let initial_value = initial_value.to_string();
+        let writable_value = !initial_read_only.as_bool();
 
         let Ok(text_pattern) = (unsafe { focused.GetCurrentPattern(UIA_TextPatternId) }) else {
             return not_applicable("text_pattern_unavailable");
@@ -4820,11 +4876,21 @@ fn try_type_focused_empty_document(
         let Ok(_initial_document_range) = (unsafe { text_pattern.DocumentRange() }) else {
             return not_applicable("document_range_unavailable");
         };
+        let collapsed_caret_at_end = if initial_value.is_empty() {
+            false
+        } else {
+            match text_pattern_caret_at_document_end(&text_pattern) {
+                Ok(at_end) => at_end,
+                Err(stage) => return not_applicable(stage),
+            }
+        };
         if !focused_document_eligible(
             unsafe { GetForegroundWindow() } == target
                 && native_window_pid(target) == Some(target_pid),
-            writable_empty_value,
+            writable_value,
+            initial_value.is_empty(),
             single_text_selection,
+            collapsed_caret_at_end,
         ) {
             return not_applicable("initial_eligibility_not_met");
         }
@@ -4839,21 +4905,32 @@ fn try_type_focused_empty_document(
         {
             return not_applicable("target_or_focus_changed_before_write");
         }
-        if !unsafe { value_pattern.CurrentIsReadOnly() }.is_ok_and(|read_only| !read_only.as_bool())
-            || !unsafe { value_pattern.CurrentValue() }
-                .is_ok_and(|value| value.to_string().is_empty())
-        {
-            return not_applicable("value_not_empty_before_write");
+        let Ok(read_only_before_write) = (unsafe { value_pattern.CurrentIsReadOnly() }) else {
+            return not_applicable("value_read_only_state_unavailable_before_write");
+        };
+        let Ok(value_before_write) = (unsafe { value_pattern.CurrentValue() }) else {
+            return not_applicable("value_unavailable_before_write");
+        };
+        if read_only_before_write.as_bool() || value_before_write.to_string() != initial_value {
+            return not_applicable("value_changed_or_read_only_before_write");
+        }
+        if !initial_value.is_empty() {
+            match text_pattern_caret_at_document_end(&text_pattern) {
+                Ok(true) => {}
+                Ok(false) => return not_applicable("caret_not_at_document_end_before_write"),
+                Err(stage) => return not_applicable(stage),
+            }
         }
 
+        let expected_value = focused_document_appended_value(&initial_value, text);
         let attempted = true;
         let write_result = (|| -> Result<(), &'static str> {
-            let value = BSTR::from(text);
+            let value = BSTR::from(expected_value.as_str());
             unsafe { value_pattern.SetValue(&value) }
                 .map_err(|_| "ValuePattern.SetValue failed after dispatch")?;
             let actual_value = unsafe { value_pattern.CurrentValue() }
                 .map_err(|_| "ValuePattern read-back failed after dispatch")?;
-            if !normalized_text_matches(text, &actual_value.to_string()) {
+            if !normalized_text_matches(&expected_value, &actual_value.to_string()) {
                 return Err("ValuePattern read-back did not match after dispatch");
             }
 
@@ -4905,7 +4982,7 @@ fn try_type_focused_empty_document(
             }
             let final_value = unsafe { value_pattern.CurrentValue() }
                 .map_err(|_| "Final ValuePattern read-back failed after dispatch")?;
-            if !normalized_text_matches(text, &final_value.to_string()) {
+            if !normalized_text_matches(&expected_value, &final_value.to_string()) {
                 return Err("ValuePattern changed during caret placement");
             }
 
@@ -4955,16 +5032,31 @@ fn focused_document_tool_result(
 #[cfg(test)]
 mod focused_document_type_tests {
     use super::{
-        classify_focused_document_write, focused_document_eligible,
-        normalize_document_line_endings, normalized_text_matches, FocusedDocumentTypeOutcome,
+        classify_focused_document_write, focused_document_appended_value,
+        focused_document_eligible, normalize_document_line_endings, normalized_text_matches,
+        FocusedDocumentTypeOutcome,
     };
 
     #[test]
-    fn focused_document_requires_every_safe_precondition() {
-        assert!(focused_document_eligible(true, true, true));
-        assert!(!focused_document_eligible(false, true, true));
-        assert!(!focused_document_eligible(true, false, true));
-        assert!(!focused_document_eligible(true, true, false));
+    fn focused_document_accepts_empty_or_a_collapsed_end_caret_only() {
+        assert!(focused_document_eligible(true, true, true, true, false));
+        assert!(focused_document_eligible(true, true, false, true, true));
+        assert!(!focused_document_eligible(true, true, false, true, false));
+        assert!(!focused_document_eligible(true, true, false, false, true));
+        assert!(!focused_document_eligible(false, true, false, true, true));
+        assert!(!focused_document_eligible(true, false, false, true, true));
+    }
+
+    #[test]
+    fn append_normalizes_prefix_and_suffix_separately() {
+        assert_eq!(
+            focused_document_appended_value("marker\r", "\n杭州东\r\n"),
+            "marker\n\n杭州东\n"
+        );
+        assert_eq!(
+            focused_document_appended_value("", "new\r\nline"),
+            "new\r\nline"
+        );
     }
 
     #[test]
