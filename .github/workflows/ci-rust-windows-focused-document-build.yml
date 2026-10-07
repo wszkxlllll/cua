@@ -1,0 +1,61 @@
+name: "Fork: focused Document Windows build"
+
+on:
+  push:
+    branches:
+      - codex/windows-focused-document-build-20261007
+
+permissions:
+  contents: read
+
+concurrency:
+  group: focused-document-windows-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CUA_TELEMETRY: "0"
+  DO_NOT_TRACK: "1"
+  CARGO_TERM_COLOR: "never"
+
+jobs:
+  build:
+    name: Windows focused Document source checks
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - name: Checkout pushed build branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 2
+
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+
+      - name: Verify build commit contains only this workflow over the PR head
+        shell: pwsh
+        working-directory: libs/cua-driver/rust
+        env:
+          EXPECTED_PR_HEAD: 73d4148087e7d4a96a1e97bfabd71fa09733d888
+        run: |
+          $parent = (git rev-parse HEAD^).Trim()
+          if ($parent -ne $env:EXPECTED_PR_HEAD) {
+            throw "Expected parent $env:EXPECTED_PR_HEAD, got $parent"
+          }
+          $changed = @(git diff-tree --no-commit-id --name-only -r HEAD)
+          if ($changed.Count -ne 1 -or $changed[0] -ne ".github/workflows/ci-rust-windows-focused-document-build.yml") {
+            throw "Build commit must add only the fork-only workflow; changed paths: $($changed -join ', ')"
+          }
+
+      - name: Check Rust formatting
+        working-directory: libs/cua-driver/rust
+        run: cargo fmt --all -- --check
+
+      - name: Run platform-windows unit tests
+        working-directory: libs/cua-driver/rust
+        env:
+          CUA_TEST_ALLOW_CLIPBOARD: "1"
+        run: cargo test --locked -p platform-windows --lib
+
+      - name: Build the cua-driver release binary
+        working-directory: libs/cua-driver/rust
+        run: cargo build --locked --release -p cua-driver --bin cua-driver
