@@ -1,0 +1,23 @@
+name: "Fork: PR 4836 canonical Windows certification"
+
+on:
+  push:
+    branches:
+      - codex/windows-focused-document-native-cert-20261008
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: pr4836-windows-native-certification
+  cancel-in-progress: false
+
+jobs:
+  windows-e2e:
+    name: Canonical Windows E2E at PR head 04923351
+    uses: trycua/cua/.github/workflows/e2e-rust-windows.yml@49e924c4632882134b204b2e8a0ce8fae44418df
+    with:
+      ref: 0492335190db987ec928bc95d7c5437860c438d7
+      runner: windows-latest
+      lane: all
