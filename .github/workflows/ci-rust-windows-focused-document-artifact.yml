@@ -1,0 +1,170 @@
+name: "Fork: PR 4836 focused Document Windows artifact"
+
+on:
+  push:
+    branches:
+      - codex/windows-focused-document-artifact-20261009
+
+permissions:
+  contents: read
+
+concurrency:
+  group: focused-document-artifact-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CUA_TELEMETRY: "0"
+  DO_NOT_TRACK: "1"
+  CARGO_TERM_COLOR: "never"
+
+jobs:
+  build:
+    name: Windows source checks and isolated candidate artifact
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - name: Checkout pushed build branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 4
+
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+
+      - name: Verify exact PR source and workflow-only build commit
+        shell: pwsh
+        working-directory: libs/cua-driver/rust
+        env:
+          EXPECTED_PR_HEAD: 0492335190db987ec928bc95d7c5437860c438d7
+          EXPECTED_MAIN_BASE: b86959306a92dec1598f15df80249497e7ea3a85
+        run: |
+          $ErrorActionPreference = "Stop"
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -ne $env:GITHUB_SHA) {
+            throw "Checkout HEAD does not match the workflow commit."
+          }
+
+          $sourceCommit = (git rev-parse $env:EXPECTED_PR_HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $sourceCommit -ne $env:EXPECTED_PR_HEAD) {
+            throw "The exact PR source commit is unavailable."
+          }
+          $buildParent = (git rev-parse "${head}^" ).Trim()
+          if ($LASTEXITCODE -ne 0 -or $buildParent -ne $sourceCommit) {
+            throw "The build commit must be a direct child of the exact PR head."
+          }
+
+          $workflowPath = ".github/workflows/ci-rust-windows-focused-document-artifact.yml"
+          $buildChanges = @(git diff-tree --no-commit-id --name-only -r $head)
+          if ($LASTEXITCODE -ne 0 -or $buildChanges.Count -ne 1 -or $buildChanges[0] -ne $workflowPath) {
+            throw "The build commit may add only this fork-only workflow. Changed paths: $($buildChanges -join ', ')"
+          }
+
+          $expectedPrPaths = @(
+            "libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs",
+            "libs/cua-driver/rust/crates/platform-windows/src/uia/focused_document.rs",
+            "libs/cua-driver/rust/crates/platform-windows/src/uia/mod.rs",
+            "libs/cua-driver/rust/crates/platform-windows/src/uia/windows_enum.rs"
+          ) | Sort-Object
+          $actualPrPaths = @(git diff --name-only $env:EXPECTED_MAIN_BASE $sourceCommit | Sort-Object)
+          if ($LASTEXITCODE -ne 0 -or ($actualPrPaths -join "`n") -ne ($expectedPrPaths -join "`n")) {
+            throw "The PR source tree no longer matches the reviewed four-file scope. Paths: $($actualPrPaths -join ', ')"
+          }
+
+      - name: Check Rust formatting
+        working-directory: libs/cua-driver/rust
+        run: cargo fmt --all -- --check
+
+      - name: Run platform-windows unit tests
+        working-directory: libs/cua-driver/rust
+        env:
+          CUA_TEST_ALLOW_CLIPBOARD: "1"
+        run: cargo test --locked -p platform-windows --lib
+
+      - name: Build the exact cua-driver release binary
+        working-directory: libs/cua-driver/rust
+        run: cargo build --locked --release -p cua-driver --bin cua-driver
+
+      - name: Prepare the binary-only artifact and provenance manifest
+        shell: pwsh
+        working-directory: libs/cua-driver/rust
+        env:
+          EXPECTED_PR_HEAD: 0492335190db987ec928bc95d7c5437860c438d7
+          EXPECTED_MAIN_BASE: b86959306a92dec1598f15df80249497e7ea3a85
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sourceCommit = $env:EXPECTED_PR_HEAD
+          $sourceTree = (git rev-parse "${sourceCommit}^{tree}").Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Could not resolve the candidate source tree." }
+
+          $workspaceText = Get-Content -LiteralPath "Cargo.toml" -Raw -Encoding UTF8
+          $workspaceSection = [regex]::Match($workspaceText, '(?ms)^\[workspace\.package\](?<body>.*?)(?=^\[|\z)')
+          $versionMatch = [regex]::Match($workspaceSection.Groups["body"].Value, '(?m)^\s*version\s*=\s*"([^"]+)"')
+          if (-not $workspaceSection.Success -or -not $versionMatch.Success) {
+            throw "Could not read the Rust workspace package version."
+          }
+          $driverVersion = $versionMatch.Groups[1].Value
+          if ($driverVersion -ne "0.34.0") { throw "Expected reviewed candidate version 0.34.0, got $driverVersion." }
+
+          $sourcePaths = @(
+            "libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs",
+            "libs/cua-driver/rust/crates/platform-windows/src/uia/focused_document.rs",
+            "libs/cua-driver/rust/crates/platform-windows/src/uia/mod.rs",
+            "libs/cua-driver/rust/crates/platform-windows/src/uia/windows_enum.rs"
+          )
+          $sourceFiles = [ordered]@{}
+          foreach ($path in $sourcePaths) {
+            $blob = (git rev-parse "${sourceCommit}:$path").Trim()
+            if ($LASTEXITCODE -ne 0) { throw "Could not resolve source blob for $path." }
+            $sourceFiles[$path] = $blob
+          }
+
+          $binarySource = "target/release/cua-driver.exe"
+          if (-not (Test-Path -LiteralPath $binarySource -PathType Leaf)) {
+            throw "The expected release binary was not produced."
+          }
+          $artifactDirectory = Join-Path $PWD "focused-document-artifact"
+          New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
+          $binaryPath = Join-Path $artifactDirectory "cua-driver.exe"
+          Copy-Item -LiteralPath $binarySource -Destination $binaryPath
+          $binaryItem = Get-Item -LiteralPath $binaryPath
+          if ($binaryItem.Length -lt 1000000 -or $binaryItem.Length -gt 100000000) {
+            throw "The release binary size is outside the expected 1 MB to 100 MB range."
+          }
+          $binarySha256 = (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $cargoLockSha256 = (Get-FileHash -LiteralPath "Cargo.lock" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifest = [ordered]@{
+            schemaVersion = 1
+            sourceBaseCommit = $env:EXPECTED_MAIN_BASE
+            sourceCommit = $sourceCommit
+            sourceTree = $sourceTree
+            driverVersion = $driverVersion
+            cargoLockSha256 = $cargoLockSha256
+            sourceFiles = $sourceFiles
+            workflowCommit = $env:GITHUB_SHA
+            workflowParent = (git rev-parse "${env:GITHUB_SHA}^").Trim()
+            binary = [ordered]@{
+              file = "cua-driver.exe"
+              bytes = $binaryItem.Length
+              sha256 = $binarySha256
+              target = "x86_64-pc-windows-msvc"
+              profile = "release"
+            }
+          }
+          $manifestPath = Join-Path $artifactDirectory "manifest.json"
+          $manifestJson = ConvertTo-Json -InputObject $manifest -Depth 6
+          Set-Content -LiteralPath $manifestPath -Value $manifestJson -Encoding utf8NoBOM
+          $readBack = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+          if ($readBack.sourceCommit -ne $sourceCommit -or $readBack.binary.sha256 -ne $binarySha256) {
+            throw "The provenance manifest did not survive UTF-8 read-back."
+          }
+
+      - name: Upload only the candidate executable and provenance manifest
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.2
+        with:
+          name: pr4836-focused-document-0492335190db987ec928bc95d7c5437860c438d7
+          path: |
+            libs/cua-driver/rust/focused-document-artifact/cua-driver.exe
+            libs/cua-driver/rust/focused-document-artifact/manifest.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
